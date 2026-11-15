@@ -63,14 +63,19 @@ pub fn run(args: &[String], io: &mut Io, pack: InstalledPack) -> i32 {
             io.out(&format!("impeccable-engine {VERSION}\n"));
             0
         }
+        "motion-capture" => impeccable_browser::motion::run(rest, io),
         "detect" => detect(rest, io, &engines, pack.rule_pack),
         "foundations" => crate::foundations::run(rest, io, &engines, pack.rule_pack),
         "ignores" | "ignore" => impeccable_detect::run_ignores(rest, io),
         // Account sign-in. These never dispatch to the Pro engine.
         "login" => {
             let code = impeccable_account::run_login(rest, io);
-            if code == 0 {
+            // Help exits 0 too; only a finished sign-in earns the follow-ups.
+            let help = rest.iter().any(|a| a == "--help" || a == "-h");
+            if code == 0 && !help {
                 crate::setup_report::schedule(io);
+                scan_after_login(io, &engines, pack.rule_pack);
+                crate::loop_install::after_login(io);
             }
             code
         }
@@ -78,6 +83,7 @@ pub fn run(args: &[String], io: &mut Io, pack: InstalledPack) -> i32 {
         "setup-report" => crate::setup_report::run(io),
         "logout" => impeccable_account::run_logout(rest, io),
         "whoami" => impeccable_account::run_whoami(rest, io),
+        "status" => impeccable_account::setup_status::run(rest, io),
         "taste-refresh" => impeccable_account::taste::run_refresh(rest, io),
         "world" => impeccable_account::world::run(rest, io),
         "critiques-refresh" => impeccable_account::critiques::run_refresh(rest, io),
@@ -231,6 +237,73 @@ fn detect(
     code
 }
 
+/// Right after a sign-in, once per repository from this machine: the full
+/// scan and upload a signed-in `impeccable detect` makes, so the repository
+/// is in the person's account at once (its foundations upload founds a Pro
+/// or Team city). Only the local detector runs; the person sees one line,
+/// and nothing here changes the sign-in's exit code.
+fn scan_after_login(
+    io: &mut Io,
+    engines: &impeccable_detect::Engines,
+    rule_pack: Option<&'static dyn impeccable_core::rule_pack::RulePack>,
+) {
+    use impeccable_account::health;
+    use std::io::Write;
+    // CI, sync turned off, or a grant that can't record a repository: say
+    // nothing. A telemetry opt-out doesn't stop it: signing in is the consent.
+    if !health::wanted_at_sign_in(io) || !health::can_record(io) {
+        return;
+    }
+    let cwd = io.cwd.display().to_string();
+    let Some(root) = health::repo_top(&cwd) else {
+        io.err("Not in a repository, so nothing was scanned. Run impeccable detect in one to add it to your account.\n");
+        return;
+    };
+    if health::first_scan_done(&io.env, &root) {
+        return;
+    }
+    io.err("Scanning this repository for your account (Ctrl-C skips it)...\n");
+    let _ = io.stderr.flush();
+    let started = std::time::SystemTime::now();
+    let mut report = None;
+    // The findings stay off the terminal: the line below sums them up.
+    let out = std::mem::replace(&mut io.stdout, Box::new(std::io::sink()));
+    let err = std::mem::replace(&mut io.stderr, Box::new(std::io::sink()));
+    // Scan from the root, as `detect` there would: config, ignores and the
+    // design system are read from the working directory, not a subdirectory.
+    let cwd = std::mem::replace(&mut io.cwd, std::path::PathBuf::from(&root));
+    let args = [root.clone(), "--json".to_string()];
+    let _ = impeccable_detect::cli::run_detect_reporting(&args, io, engines, rule_pack, &mut report);
+    io.cwd = cwd;
+    io.stdout = out;
+    io.stderr = err;
+    let Some(full) = report else {
+        io.err("Couldn't scan this repository. Run impeccable detect here to add it to your account.\n");
+        return;
+    };
+    let (findings, files) = (full.findings.len(), full.files_scanned);
+    let foundations = crate::foundations::from_scan(&full.root, &full, health::foundations_wanted(io));
+    let scan = health_scan(full, foundations, started);
+    let synced = health::after_sign_in_scan(io, &scan);
+    let found = match findings {
+        1 => "1 finding".to_string(),
+        n => format!("{n} findings"),
+    };
+    if synced.recorded() {
+        let find = match impeccable_account::config::Account::from_env(&io.env).ok().and_then(|a| a.home_url()) {
+            Some(url) => format!("See it on your Home: {url}"),
+            None => "Find it under Repositories in your Impeccable account.".to_string(),
+        };
+        io.err(&format!(
+            "Added this repository to your account: {found} in {files} files. Sent its name, finding counts and foundations checks, never your code or file names. {find}\n"
+        ));
+    } else {
+        io.err(&format!(
+            "Scanned this repository ({found}), but couldn't add it to your account just now. Run impeccable detect here to try again.\n"
+        ));
+    }
+}
+
 /// Design health's view of a full scan, with its foundations states.
 pub(crate) fn health_scan(
     full: impeccable_detect::cli::FullScan,
@@ -283,11 +356,13 @@ const KNOWN_VERBS: &[&str] = &[
     "--version",
     "-v",
     "engine-probe",
+    "motion-capture",
     "ignores",
     "ignore",
     "login",
     "logout",
     "whoami",
+    "status",
     "world",
     "health",
     "foundations",
